@@ -4,6 +4,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -169,6 +170,11 @@ BAD_POSTURE_LIMIT = 2.0
 VIBRATION_DURATION = 2.0
 VISIBILITY_THRESHOLD = 0.50
 CALIBRATION_SECONDS = 3.0
+CALIBRATION_RETRY_SECONDS = 2.0
+
+# No monitor/VNC is required.  When DISPLAY is unavailable the program
+# automatically runs in headless mode.  --headless can also force this mode.
+HEADLESS = "--headless" in sys.argv or not os.environ.get("DISPLAY")
 
 current_led_status = "GREEN"
 
@@ -401,10 +407,11 @@ def calibrate_baseline(cap, pose, window_name):
             1,
         )
 
-        cv2.imshow(window_name, frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q") or window_was_closed(window_name):
-            raise UserRequestedExit
+        if not HEADLESS:
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q") or window_was_closed(window_name):
+                raise UserRequestedExit
 
     if not baseline_samples:
         raise RuntimeError(
@@ -493,6 +500,7 @@ def main():
     score_count = 0
 
     try:
+        print(f"[DISPLAY] {'Headless/offline mode' if HEADLESS else 'UI mode'}")
         print("[CAMERA] CSI via rpicam-vid")
         cap = RpicamCapture(
             width=FRAME_WIDTH,
@@ -509,7 +517,24 @@ def main():
             min_tracking_confidence=0.5,
         )
 
-        baseline = calibrate_baseline(cap, pose, window_name)
+        # In standalone mode, do not terminate merely because nobody was in
+        # front of the camera during boot. Yellow LED means "waiting/calibrating".
+        set_led("YELLOW")
+        while True:
+            try:
+                baseline = calibrate_baseline(cap, pose, window_name)
+                set_led("GREEN")
+                break
+            except RuntimeError as calibration_error:
+                if not HEADLESS:
+                    raise
+                print(
+                    f"[CALIBRATION] {calibration_error} "
+                    f"Retrying in {CALIBRATION_RETRY_SECONDS:.0f} seconds."
+                )
+                motor_off()
+                set_led("YELLOW")
+                time.sleep(CALIBRATION_RETRY_SECONDS)
 
         bad_timer = 0.0
         alert_triggered = False
@@ -695,21 +720,23 @@ def main():
                 -1,
             )
 
-            cv2.imshow(window_name, frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or window_was_closed(window_name):
-                print("[PROGRAM] Monitoring stopped by user.")
-                break
+            if not HEADLESS:
+                cv2.imshow(window_name, frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q") or window_was_closed(window_name):
+                    print("[PROGRAM] Monitoring stopped by user.")
+                    break
 
         average_score = (
             score_sum / score_count if score_count > 0 else 0.0
         )
-        show_summary(
-            window_name,
-            total_monitored_time,
-            total_bad_time,
-            average_score,
-        )
+        if not HEADLESS:
+            show_summary(
+                window_name,
+                total_monitored_time,
+                total_bad_time,
+                average_score,
+            )
 
     except UserRequestedExit:
         print("[PROGRAM] Closed by user.")
@@ -734,7 +761,8 @@ def main():
         if GPIO_AVAILABLE:
             GPIO.cleanup()
 
-        cv2.destroyAllWindows()
+        if not HEADLESS:
+            cv2.destroyAllWindows()
         print("[PROGRAM] Closed safely.")
 
 
