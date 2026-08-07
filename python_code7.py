@@ -726,7 +726,7 @@ def main():
                         status_text = "WARNING"
                         status_color = (255, 0, 0)  # OpenCV BGR: blue
 
-                        # The XIAO firmware produces two 0.2-second pulses with a 0.3-second gap.
+                        # The XIAO firmware produces two 0.3-second pulses.
                         posture_band.set_state("W")
                     else:
                         set_led("RED")
@@ -890,7 +890,7 @@ if __name__ == "__main__":
     main()
 라이브러리
 /
-python_code7_1.py
+python_code7_EN.py
 
 
 #!/usr/bin/env python3
@@ -1621,7 +1621,7 @@ def main():
                         status_text = "WARNING"
                         status_color = (255, 0, 0)  # OpenCV BGR: blue
 
-                        # The XIAO firmware produces two 0.2-second pulses with a 0.3-second gap.
+                        # The XIAO firmware produces two 0.3-second pulses.
                         posture_band.set_state("W")
                     else:
                         set_led("RED")
