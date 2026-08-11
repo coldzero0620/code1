@@ -12,14 +12,15 @@
 #   - BLE N/W/B/P/S, heartbeat, reconnect/resync and WARNING reminder
 #   - shared runtime state prepared for later Flask integration
 #   - SPACE pause/resume; pause always requests wristband motor OFF
-#   - ESC opens summary; ESC/ENTER or window X closes UI only
+#   - ESC opens a frozen summary and pauses posture monitoring
+#   - ESC in summary returns to the live camera and resumes monitoring
+#   - ENTER has no UI action; window X closes UI only
 #   - posture detection, LED and BLE continue after the UI is closed
-#   - closing the UI automatically resumes monitoring if it was paused
+#   - wristband battery telemetry is received by BLE Notify and shown in UI
 #   - BLE loss indicator: RED -> GREEN -> BLUE, one second per color
 #   - GPIO23 slide-switch debounce and orderly Raspberry Pi poweroff request
 #
 # Intentionally deferred:
-#   - battery telemetry
 #   - wristband battery switch (implemented as a physical power cut-off)
 #   - Flask/MJPEG server and Raspberry Pi access point
 
@@ -272,6 +273,8 @@ class RuntimeState:
         self.side = "-"
         self.model_source = "RULE"
         self.ble_connected = False
+        self.battery_percent = None
+        self.battery_voltage = None
         self.camera_ok = False
         self.updated_at = time.monotonic()
 
@@ -318,6 +321,8 @@ class RuntimeState:
                 "side": self.side,
                 "model_source": self.model_source,
                 "ble_connected": self.ble_connected,
+                "battery_percent": self.battery_percent,
+                "battery_voltage": self.battery_voltage,
                 "camera_ok": self.camera_ok,
                 "updated_at": self.updated_at,
             }
@@ -578,6 +583,7 @@ class LedStatusWorker:
 # ---------------------------------------------------------------------------
 BLE_DEVICE_NAME = "Posture-Band"
 BLE_CHARACTERISTIC_UUID = "abcdefab-1234-5678-1234-abcdefabcdef"
+BLE_BATTERY_CHARACTERISTIC_UUID = "abcdefac-1234-5678-1234-abcdefabcdef"
 BLE_SCAN_TIMEOUT_SECONDS = 5.0
 BLE_RETRY_SECONDS = 1.0
 BLE_HEARTBEAT_SECONDS = 1.0
@@ -638,6 +644,24 @@ class BlePostureBand:
             self._thread.join(timeout=6.0)
         self._runtime_state.update(ble_connected=False)
 
+    def _handle_battery_notification(self, sender, data):
+        try:
+            payload = bytes(data).decode("utf-8").strip()
+            parts = payload.split(",")
+            if len(parts) != 3 or parts[0].upper() != "BAT":
+                print(f"[BLE] Ignored battery payload: {payload!r}")
+                return
+
+            percent = max(0, min(100, int(parts[1])))
+            voltage = float(parts[2])
+            self._runtime_state.update(
+                battery_percent=percent,
+                battery_voltage=voltage,
+            )
+            print(f"[BLE] Battery: {percent}% ({voltage:.2f}V)")
+        except (UnicodeDecodeError, ValueError) as error:
+            print(f"[BLE] Invalid battery notification: {error}")
+
     def _thread_main(self):
         while not self._stop_event.is_set():
             try:
@@ -683,6 +707,25 @@ class BlePostureBand:
                 ) as client:
                     print(f"[BLE] Connected: {BLE_DEVICE_NAME}")
                     self._runtime_state.update(ble_connected=True)
+
+                    await client.start_notify(
+                        BLE_BATTERY_CHARACTERISTIC_UUID,
+                        self._handle_battery_notification,
+                    )
+                    try:
+                        initial_battery = await client.read_gatt_char(
+                            BLE_BATTERY_CHARACTERISTIC_UUID
+                        )
+                        self._handle_battery_notification(
+                            BLE_BATTERY_CHARACTERISTIC_UUID,
+                            initial_battery,
+                        )
+                    except Exception as battery_read_error:
+                        print(
+                            f"[BLE] Initial battery read failed: "
+                            f"{battery_read_error}"
+                        )
+
                     last_sent_state = None
                     last_heartbeat_time = 0.0
                     last_warning_time = 0.0
@@ -724,15 +767,27 @@ class BlePostureBand:
 
                         await asyncio.sleep(0.1)
 
-                self._runtime_state.update(ble_connected=False)
+                self._runtime_state.update(
+                    ble_connected=False,
+                    battery_percent=None,
+                    battery_voltage=None,
+                )
 
             except Exception as error:
-                self._runtime_state.update(ble_connected=False)
+                self._runtime_state.update(
+                    ble_connected=False,
+                    battery_percent=None,
+                    battery_voltage=None,
+                )
                 if not self._stop_event.is_set():
                     print(f"[BLE] Connection lost: {error}")
                     await asyncio.sleep(BLE_RETRY_SECONDS)
 
-        self._runtime_state.update(ble_connected=False)
+        self._runtime_state.update(
+            ble_connected=False,
+            battery_percent=None,
+            battery_voltage=None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1259,12 +1314,12 @@ def build_summary_frame(
             (100, 255, 100),
         ),
         (
-            f"BACKGROUND MONITORING: {monitor_text}",
+            f"POSTURE MONITORING: {monitor_text}",
             (135, 435),
             monitor_color,
         ),
         (
-            "ENTER / ESC: Close UI only",
+            "ESC: Return to live camera",
             (205, 500),
             (200, 200, 200),
         ),
@@ -1313,6 +1368,16 @@ def draw_monitor_overlay(frame, snapshot):
         else "--"
     )
     ble_text = "CONNECTED" if snapshot["ble_connected"] else "SEARCHING"
+    if (
+        snapshot["battery_percent"] is not None
+        and snapshot["battery_voltage"] is not None
+    ):
+        battery_text = (
+            f"BATTERY: {snapshot['battery_percent']}% "
+            f"({snapshot['battery_voltage']:.2f}V)"
+        )
+    else:
+        battery_text = "BATTERY: --"
 
     rows = (
         (f"STATUS : {status}", 40, status_color, 0.72, 2),
@@ -1346,6 +1411,7 @@ def draw_monitor_overlay(frame, snapshot):
             1,
         ),
         (f"BLE: {ble_text}", 228, (220, 220, 220), 0.52, 1),
+        (battery_text, 258, (220, 220, 220), 0.52, 1),
     )
 
     for text_value, y, color, scale, thickness in rows:
@@ -1459,7 +1525,7 @@ def main():
         normal_confirm_timer = 0.0
         non_normal_latched = False
 
-        def resume_if_paused_for_ui_close():
+        def resume_monitoring():
             nonlocal bad_timer
             nonlocal normal_confirm_timer
             nonlocal non_normal_latched
@@ -1481,8 +1547,7 @@ def main():
                 side="-",
             )
             print(
-                "[PROGRAM] Monitoring automatically resumed "
-                "because the UI was closed."
+                "[PROGRAM] Monitoring resumed."
             )
 
         while not PROGRAM_STOP_EVENT.is_set():
@@ -1679,7 +1744,7 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
 
                 if window_was_closed(window_name):
-                    resume_if_paused_for_ui_close()
+                    resume_monitoring()
                     ui_visible = False
                     close_ui_window(window_name)
                     print(
@@ -1716,23 +1781,30 @@ def main():
                         print("[PROGRAM] Monitoring resumed.")
 
                 elif ui_mode == "LIVE" and key == ESC_KEY:
+                    # Freeze all posture statistics while the report is shown.
+                    runtime_state.set_paused(True)
+                    non_normal_latched = False
+                    bad_timer = 0.0
+                    normal_confirm_timer = 0.0
+                    posture_band.set_state("S")
+                    set_led("OFF")
+                    runtime_state.update(
+                        status="PAUSED",
+                        score=None,
+                        bad_timer=0.0,
+                        side="-",
+                    )
                     ui_mode = "SUMMARY"
                     print(
-                        "[UI] Summary opened. Background posture "
-                        "monitoring is still running."
+                        "[UI] Summary opened. Posture monitoring paused."
                     )
 
-                elif (
-                    ui_mode == "SUMMARY"
-                    and key in {ESC_KEY, 10, 13}
-                ):
-                    resume_if_paused_for_ui_close()
-                    ui_visible = False
+                elif ui_mode == "SUMMARY" and key == ESC_KEY:
+                    # ESC only: return to the live camera and resume.
+                    resume_monitoring()
                     ui_mode = "LIVE"
-                    close_ui_window(window_name)
                     print(
-                        "[UI] Summary closed. Background posture "
-                        "monitoring is still running."
+                        "[UI] Returned to live camera. Monitoring resumed."
                     )
 
         if PROGRAM_STOP_EVENT.is_set():
