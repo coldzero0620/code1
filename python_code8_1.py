@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Version 8 CORE FINAL (single-file integration before modularization).
+# Version 10 FULL-FOV FINAL (IMX219 full-FOV sensor mode + battery/summary fixes).
 #
 # Included in this version:
 #   - CSI camera opened by one capture worker
 #   - latest-frame overwrite buffer (no old-frame queue)
-#   - 640x480 capture/display and 320x240 MediaPipe analysis
+#   - IMX219 1640x1232 full-FOV sensor mode -> 640x480 output/display
+#   - 320x240 MediaPipe analysis (AI workload unchanged)
 #   - camera automatic reopen and fatal-timeout reporting
 #   - baseline sample-count/stability validation
 #   - posture hysteresis and confirmed recovery
@@ -120,6 +121,11 @@ class RpicamCapture:
             "0",
             "--camera",
             str(camera_index),
+            # IMX219 Camera Module 2: force the 1640x1232 2x2-binned
+            # full-sensor mode. This avoids the center-cropped 640x480
+            # sensor mode while keeping the encoded output at 640x480.
+            "--mode",
+            "1640:1232:10:P",
             "--width",
             str(width),
             "--height",
