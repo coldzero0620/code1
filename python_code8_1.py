@@ -109,7 +109,7 @@ class RpicamCapture:
     JPEG_START = b"\xff\xd8"
     JPEG_END = b"\xff\xd9"
 
-    def __init__(self, width=640, height=480, fps=15, camera_index=0):
+    def __init__(self, width=640, height=480, fps=20, camera_index=0):
         rpicam_path = shutil.which("rpicam-vid")
         if rpicam_path is None:
             raise RuntimeError("rpicam-vid command was not found.")
@@ -135,7 +135,10 @@ class RpicamCapture:
             "--codec",
             "mjpeg",
             "--quality",
-            "70",
+            str(MJPEG_QUALITY),
+            # Flush each completed encoded frame immediately to stdout.
+            # This reduces avoidable userspace/output buffering latency.
+            "--flush",
             "--output",
             "-",
         ]
@@ -164,12 +167,15 @@ class RpicamCapture:
 
     def read(self):
         while self.isOpened():
-            start = self.buffer.find(self.JPEG_START)
-            if start >= 0:
-                end = self.buffer.find(self.JPEG_END, start + 2)
-                if end >= 0:
-                    jpeg_data = bytes(self.buffer[start : end + 2])
-                    del self.buffer[: end + 2]
+            # If more than one complete JPEG has accumulated, decode the newest
+            # complete frame instead of walking through stale frames one by one.
+            # This deliberately prefers low latency over displaying every frame.
+            last_end = self.buffer.rfind(self.JPEG_END)
+            if last_end >= 0:
+                last_start = self.buffer.rfind(self.JPEG_START, 0, last_end)
+                if last_start >= 0:
+                    jpeg_data = bytes(self.buffer[last_start : last_end + 2])
+                    del self.buffer[: last_end + 2]
 
                     frame = cv2.imdecode(
                         np.frombuffer(jpeg_data, dtype=np.uint8),
@@ -190,10 +196,13 @@ class RpicamCapture:
                 break
             self.buffer.extend(data)
 
-            if len(self.buffer) > 8_000_000:
-                last_start = self.buffer.rfind(self.JPEG_START)
-                if last_start >= 0:
-                    del self.buffer[:last_start]
+            # Hard safety limit: if the pipe ever backs up badly, retain only
+            # the newest JPEG start marker so old video cannot create seconds
+            # of accumulated delay.
+            if len(self.buffer) > 2_000_000:
+                newest_start = self.buffer.rfind(self.JPEG_START)
+                if newest_start >= 0:
+                    del self.buffer[:newest_start]
                 else:
                     self.buffer.clear()
 
@@ -244,7 +253,8 @@ CAPTURE_WIDTH = 640
 CAPTURE_HEIGHT = 480
 ANALYSIS_WIDTH = 320
 ANALYSIS_HEIGHT = 240
-CAMERA_FPS = 15
+CAMERA_FPS = 20
+MJPEG_QUALITY = 60
 
 # Enter and exit thresholds are deliberately different. This prevents a
 # single noisy frame around the boundary from rapidly toggling the state.
@@ -1481,8 +1491,8 @@ def main():
             f"{'Headless/offline mode' if not ui_visible else 'UI mode'}"
         )
         print(
-            f"[CAMERA] Capture {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} @ "
-            f"{CAMERA_FPS} FPS; analysis "
+            f"[CAMERA] Full-FOV IMX219 -> {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} @ "
+            f"{CAMERA_FPS} FPS, MJPEG quality {MJPEG_QUALITY}; analysis "
             f"{ANALYSIS_WIDTH}x{ANALYSIS_HEIGHT}"
         )
 
