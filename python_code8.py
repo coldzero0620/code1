@@ -16,10 +16,11 @@
 #   - posture detection, LED and BLE continue after the UI is closed
 #   - closing the UI automatically resumes monitoring if it was paused
 #   - BLE loss indicator: RED -> GREEN -> BLUE, one second per color
+#   - GPIO23 slide-switch debounce and orderly Raspberry Pi poweroff request
 #
 # Intentionally deferred:
 #   - battery telemetry
-#   - Raspberry Pi / wristband slide-switch input
+#   - wristband battery switch (implemented as a physical power cut-off)
 #   - Flask/MJPEG server and Raspberry Pi access point
 
 import asyncio
@@ -61,7 +62,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 class DummyGPIO:
     BCM = "BCM"
+    IN = "IN"
     OUT = "OUT"
+    PUD_UP = "PUD_UP"
     LOW = 0
     HIGH = 1
 
@@ -71,11 +74,14 @@ class DummyGPIO:
     def setwarnings(self, enabled):
         pass
 
-    def setup(self, pin, mode):
+    def setup(self, pin, mode, **kwargs):
         pass
 
     def output(self, pin, state):
         pass
+
+    def input(self, pin):
+        return self.HIGH
 
     def cleanup(self):
         pass
@@ -214,6 +220,17 @@ class RpicamCapture:
 LED_R = 22
 LED_G = 27
 LED_B = 17
+
+# Three-pin SPDT slide switch used as a two-wire, active-LOW shutdown request:
+#   center pin -> BCM GPIO23 (physical pin 16)
+#   one outer pin -> GND
+#   unused outer pin -> not connected
+# The internal pull-up keeps the input HIGH while the switch is open.
+SHUTDOWN_SWITCH_PIN = 23
+SHUTDOWN_SWITCH_DEBOUNCE_SECONDS = 0.75
+SHUTDOWN_SWITCH_POLL_SECONDS = 0.05
+SHUTDOWN_SWITCH_STARTUP_GRACE_SECONDS = 2.0
+POWEROFF_COMMAND_TIMEOUT_SECONDS = 10.0
 
 # Keep capture/display resolution separate from the MediaPipe input.
 CAPTURE_WIDTH = 640
@@ -908,12 +925,120 @@ class CalibrationError(Exception):
 
 
 PROGRAM_STOP_EVENT = threading.Event()
+POWER_OFF_REQUESTED_EVENT = threading.Event()
 
 
 def handle_service_stop(signum, frame):
     # Signal handlers only set a flag. Main and calibration loops notice it
     # within their short frame-wait timeout and perform deterministic cleanup.
     PROGRAM_STOP_EVENT.set()
+
+
+class ShutdownSwitchMonitor:
+    """Debounce an active-LOW GPIO switch and request orderly OS shutdown."""
+
+    def __init__(self, pin=SHUTDOWN_SWITCH_PIN):
+        self._pin = pin
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if not GPIO_AVAILABLE:
+            print("[POWER] Shutdown switch disabled in GPIO simulation mode.")
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+
+        GPIO.setup(self._pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="shutdown-switch",
+            daemon=True,
+        )
+        self._thread.start()
+        print(
+            f"[POWER] Shutdown switch armed on BCM GPIO{self._pin} "
+            "(active LOW)."
+        )
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _loop(self):
+        if self._stop_event.wait(SHUTDOWN_SWITCH_STARTUP_GRACE_SECONDS):
+            return
+
+        active_since = None
+
+        while not self._stop_event.is_set():
+            try:
+                switch_is_active = GPIO.input(self._pin) == GPIO.LOW
+            except Exception as switch_error:
+                print(f"[POWER] Shutdown switch read failed: {switch_error}")
+                return
+
+            now = time.monotonic()
+            if switch_is_active:
+                if active_since is None:
+                    active_since = now
+                elif (
+                    now - active_since
+                    >= SHUTDOWN_SWITCH_DEBOUNCE_SECONDS
+                ):
+                    print(
+                        "[POWER] Shutdown switch activated. "
+                        "Stopping BLE, camera and GPIO before poweroff."
+                    )
+                    POWER_OFF_REQUESTED_EVENT.set()
+                    PROGRAM_STOP_EVENT.set()
+                    return
+            else:
+                active_since = None
+
+            self._stop_event.wait(SHUTDOWN_SWITCH_POLL_SECONDS)
+
+
+def request_os_poweroff():
+    """Ask systemd to power off after application cleanup has completed."""
+
+    systemctl_path = shutil.which("systemctl") or "/usr/bin/systemctl"
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        command = [systemctl_path, "poweroff"]
+    else:
+        sudo_path = shutil.which("sudo")
+        if sudo_path is None:
+            print(
+                "[POWER] sudo was not found. The program closed safely, "
+                "but the OS was not powered off."
+            )
+            return False
+        command = [sudo_path, "-n", systemctl_path, "poweroff"]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=POWEROFF_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as poweroff_error:
+        print(f"[POWER] Poweroff command failed: {poweroff_error}")
+        return False
+
+    if result.returncode == 0:
+        print("[POWER] Raspberry Pi poweroff requested successfully.")
+        return True
+
+    error_text = (result.stderr or result.stdout or "unknown error").strip()
+    print(
+        "[POWER] Safe application shutdown completed, but OS poweroff "
+        f"was denied: {error_text}"
+    )
+    return False
 
 
 def window_was_closed(window_name):
@@ -1255,12 +1380,14 @@ def draw_monitor_overlay(frame, snapshot):
 def main():
     signal.signal(signal.SIGTERM, handle_service_stop)
     PROGRAM_STOP_EVENT.clear()
+    POWER_OFF_REQUESTED_EVENT.clear()
 
     window_name = "Posture Monitor"
     runtime_state = RuntimeState()
     camera = LatestFrameCamera(runtime_state)
     posture_band = BlePostureBand(runtime_state)
     led_status = LedStatusWorker(runtime_state)
+    shutdown_switch = ShutdownSwitchMonitor()
     pose = None
     exit_code = 0
 
@@ -1273,6 +1400,7 @@ def main():
     ui_mode = "LIVE"
 
     try:
+        shutdown_switch.start()
         led_status.start()
         posture_band.start()
         camera.start()
@@ -1610,7 +1738,10 @@ def main():
         if PROGRAM_STOP_EVENT.is_set():
             raise ServiceStopRequested
     except ServiceStopRequested:
-        print("[PROGRAM] Stop requested by systemd.")
+        if POWER_OFF_REQUESTED_EVENT.is_set():
+            print("[PROGRAM] Safe shutdown requested by GPIO switch.")
+        else:
+            print("[PROGRAM] Stop requested by systemd.")
     except RuntimeError as runtime_error:
         exit_code = 1
         print(f"[ERROR] {runtime_error}")
@@ -1623,6 +1754,7 @@ def main():
             f"{unexpected_error}"
         )
     finally:
+        shutdown_switch.stop()
         led_status.stop()
         posture_band.stop()
         camera.stop()
@@ -1636,6 +1768,9 @@ def main():
         if not HEADLESS:
             cv2.destroyAllWindows()
         print(f"[PROGRAM] Closed safely. exit_code={exit_code}")
+
+    if POWER_OFF_REQUESTED_EVENT.is_set():
+        request_os_poweroff()
 
     return exit_code
 
