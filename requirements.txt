@@ -1,0 +1,15 @@
+# 라즈베리파이 런타임 + 학습 도구 공통
+#
+# mediapipe 0.10.14는 Python 3.9~3.12만 지원한다. 3.13에서는 설치되지 않는다.
+# numpy 2.x는 mediapipe 0.10.x와 호환되지 않으므로 1.x로 고정한다.
+
+mediapipe==0.10.14
+numpy>=1.24,<2.0
+opencv-python>=4.8
+scikit-learn>=1.3
+joblib>=1.3
+pandas>=2.0
+
+# 라즈베리파이에서만 필요 (없으면 해당 기능만 꺼진다)
+bleak>=0.21 ; platform_machine == "aarch64" or platform_machine == "armv7l"
+RPi.GPIO>=0.7 ; platform_machine == "aarch64" or platform_machine == "armv7l"
